@@ -249,6 +249,7 @@ Asterisk/FreePBX ARI wiring, NPM-fronted hostnames, systemd autostart, and
 nightly DB backup — keeping each change only where upstream hadn't already
 fixed it.
 ${CONFLICTS:+Kept fork version after 3-way conflict (review): $CONFLICTS}"
+  fi
   if [ -n "${GH_TOKEN:-}" ]; then
     PUSH_URL="https://x-access-token:${GH_TOKEN}@github.com/${FORK_REPO}.git"
   else
@@ -276,7 +277,6 @@ ${CONFLICTS:+Kept fork version after 3-way conflict (review): $CONFLICTS}"
     exit 1
   fi
   echo "pushed rebuilt fork to $FORK_REPO main ($(git rev-parse --short HEAD))"
-  fi
 else
   echo "dry run — rebuilt tree ready on branch 'rebuilt' (not pushed)."
   echo "re-run with --push to publish."
