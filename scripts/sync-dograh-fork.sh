@@ -233,6 +233,13 @@ if git diff --quiet "$UPSTREAM_HEAD" origin/main -- . ':!'"$CONFLICTS" >/dev/nul
 git status --porcelain | head -5
 git add -A
 if [ "$PUSH" -eq 1 ]; then
+  # A fork sitting exactly on its last sync point rebuilds to upstream's tree,
+  # so nothing is staged — and `git commit` with an empty index is a hard
+  # failure under `set -e`. The push below is what performs the sync, so skip
+  # the commit instead of ending the job with a bare exit 1.
+  if git diff --cached --quiet; then
+    echo "no fork delta to reapply — publishing upstream's tree as it stands"
+  else
   git -c user.name="capstone-release[bot]" -c user.email="capstone-release[bot]@users.noreply.github.com" \
     commit -q -m "sync: rebase fork onto dograh-hq/dograh main ($NEW_VER) and reapply Capstone customizations
 
@@ -269,6 +276,7 @@ ${CONFLICTS:+Kept fork version after 3-way conflict (review): $CONFLICTS}"
     exit 1
   fi
   echo "pushed rebuilt fork to $FORK_REPO main ($(git rev-parse --short HEAD))"
+  fi
 else
   echo "dry run — rebuilt tree ready on branch 'rebuilt' (not pushed)."
   echo "re-run with --push to publish."
