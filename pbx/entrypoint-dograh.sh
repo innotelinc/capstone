@@ -817,24 +817,24 @@ EOF
       ' "$conf" > "$conf.tmp" 2>/dev/null && mv "$conf.tmp" "$conf"
     done
   fi
-  if ! grep -q '^\['"$webrtc_ext"'\]' "$ec2" 2>/dev/null; then
+  if ! grep -qF "[${webrtc_ext}-webrtc]" "$ec2" 2>/dev/null; then
     cat >> "$ec2" <<EOF
 
 ; Capstone WebRTC test extension — register from a browser over WSS with
 ; user ${webrtc_ext} / ${webrtc_pass} (template=webrtc-template inherits DTLS/ICE/TURN).
-[${webrtc_ext}](webrtc-template)
+[${webrtc_ext}-webrtc](webrtc-template)
 type = endpoint
-auth = ${webrtc_ext}-auth
-aors = ${webrtc_ext}
+auth = ${webrtc_ext}-webrtc-auth
+aors = ${webrtc_ext}-webrtc
 callerid = WebRTC Test <${webrtc_ext}>
 EOF
     echo ">>> [dograh-ari] webrtc test endpoint ${webrtc_ext} written to pjsip.endpoint_custom.conf"
   fi
-  if ! grep -q '^\['"$webrtc_ext"'-auth\]' "$ac" 2>/dev/null; then
+  if ! grep -qF "[${webrtc_ext}-webrtc-auth]" "$ac" 2>/dev/null; then
     cat >> "$ac" <<EOF
 
 ; WebRTC test extension auth (user ${webrtc_ext}) — ${webrtc_pass}
-[${webrtc_ext}-auth]
+[${webrtc_ext}-webrtc-auth]
 type = auth
 auth_type = userpass
 username = ${webrtc_ext}
@@ -842,11 +842,11 @@ password = ${webrtc_pass}
 EOF
     echo ">>> [dograh-ari] webrtc test auth ${webrtc_ext}-auth written to pjsip.auth_custom.conf"
   fi
-  if ! grep -q '^\['"$webrtc_ext"'\]' "$oc" 2>/dev/null; then
+  if ! grep -qF "[${webrtc_ext}-webrtc]" "$oc" 2>/dev/null; then
     cat >> "$oc" <<EOF
 
 ; WebRTC test extension AOR (single WSS contact)
-[${webrtc_ext}]
+[${webrtc_ext}-webrtc]
 type = aor
 max_contacts = 1
 remove_existing = yes
