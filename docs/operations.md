@@ -280,6 +280,18 @@ shim's startup warm-up (`TTS_SHIM_WARMUP`) removes the ~7 s first-synthesis stal
 first caller, and the audio cache makes repeated lines (the script's fixed lines, goodbyes)
 near-instant — which is why the cache matters more with af_heart than with Piper.
 
+**Switch the voice through `tts.settings` and nothing else.** In
+`model_configurations.configuration` the TTS role is `{"settings": {"model", "voice"},
+"provider_connection_uuid"}`; edit those two values in place. Adding a sibling key — notably
+`tts.connection_revision`, which looks like the obvious way to "bump" the connection — makes
+dograh read the TTS connection as a new, unauthorised one, and
+`authorize_workflow_run_start` (dograh's `quota_service.py`) then refuses *every* inbound call
+with the misleading `Quota exceeded for user 1 — hanging up inbound call` and
+`usage_info {"call_duration_seconds": 0}`. The org quota columns are innocent: on 2026-11-25
+`quota_enabled=false` and a zero token budget throughout, and calls resumed the moment the key
+was removed (identical runs: piper 75 ms, kokoro 1.76 s to first audio). If a voice change is
+followed by that quota message, check this key before touching quotas.
+
 **The addresses are container names on purpose.** Every one of them is dialled *by
 `dograh-api`*, from inside its own container: `127.0.0.1:8881` is the shim as seen from the
 host, and resolves to the dograh container itself — the symptom is a TTS connection error on
@@ -329,22 +341,17 @@ pretending to have applied it. Switching to add-on stops the bundled FreePBX on 
 Asterisks must not both be serving this host's calls. Switching back keeps the stopped
 container, so the switch can start it again without compose.
 
-### FreePBX web-UI healthcheck + auto-recovery
+### FreePBX web-UI healthcheck + auto-recovery — removed
 
-The freepbx container's own Docker healthcheck probes **Asterisk**, not the web UI — so a
-stale `/var/run/apache2/apache2.pid` kept across a container restart (Docker preserves
-`/var/run`) makes `apache2ctl` refuse to start with `httpd (pid N) already running`, the GUI
-stays down, and the container still reports healthy. `scripts/freepbx-web-recover.sh` closes
-that gap and runs every 2 minutes via the `capstone-freepbx-web.timer` systemd timer:
+The FreePBX container, its Apache pidfile failure mode, its recovery script and
+its systemd timer went with the switch. Cantus serves the control API, ARI and
+the browser softphone from one process with one healthcheck
+(`GET /healthz`), so there is no second web server to keep alive. If an old
+host still has `capstone-freepbx-web.timer` enabled, disable it:
 
 ```bash
-./scripts/freepbx-web-recover.sh check     # probe web UI only (exit 1 if down)
-./scripts/freepbx-web-recover.sh recover   # probe; clear stale pid + restart Apache if needed
+systemctl disable --now capstone-freepbx-web.timer 2>/dev/null || true
 ```
-
-It probes `:80` inside the container, and when the UI is down it clears any stale pidfile
-and restarts Apache (as `asterisk`, preserving the Apply Config fix). Idempotent — a healthy
-UI is a no-op that exits 0.
 
 ### dograh Stasis app healthcheck + auto-recovery
 
@@ -362,22 +369,184 @@ somebody intervenes by hand. The honest reading of the Control Center banner's a
 ("re-run `scripts/dograh_wire.py`") is that the fix used to *be* the repair: it now
 reactivates a parked config, so the documented remedy actually works.
 
-`scripts/dograh-ari-recover.sh` runs the check unattended, every 10 minutes via the
-`capstone-dograh-ari.timer` systemd timer:
+`deploy/ari-dupe-guard.sh` runs the check unattended, on the PBX host, from
+`/etc/cron.d/ari-dupe-guard` every five minutes. It is the **only** thing that repairs this
+range: the retired `capstone-dograh-ari.timer` ran `scripts/dograh-ari-recover.sh`, a file
+that never existed in this repo, so it could not repair anything and has been removed.
 
 ```bash
-./scripts/dograh-ari-recover.sh check     # is the Stasis app registered? (exit 1 if not)
-./scripts/dograh-ari-recover.sh recover   # ...and repair it: re-run dograh_wire.py
+/usr/local/sbin/ari-dupe-guard.sh --check   # report what it would repair, change nothing
+/usr/local/sbin/ari-dupe-guard.sh           # repair; silent unless it acts
 ```
 
-The split matters: a missing app with **ARI unreachable** is *not* repaired. dograh cannot
-register against a PBX that isn't answering, and this runs on a timer, so reactivating on a
-loop would only churn for the whole outage — it logs and exits 1 for the journal to show.
-A missing app with **ARI reachable** (the parked-config case) re-runs
-`scripts/dograh_wire.py`, which clears the parked flag, then waits for registration and
-reports whether calls can be taken again. It resolves the PBX container by compose label
-the way `scripts/smoke-e2e.sh` does, so it works on a shared voice host where the PBX is
-`zeus-freepbx` rather than `pbx-freepbx`.
+Three faults are repaired, and `/var/log/ari-dupe-guard.log` names the one it found:
+
+- **a duplicate `[dograh]` section** in the generated `ari_additional.conf`. Asterisk then
+  rejects all of `ari.conf` (*"configuration contains a duplicate object"*), every ARI user
+  disappears and `Stasis()` has no app. The block is commented out and `res_ari` reloaded.
+- **the parked telephony config** described above. The guard clears `inactive` directly in
+  dograh's Postgres, and dograh re-registers on its own 60-second refresh.
+- **`cdr`/`cel` `uniqueid`/`linkedid` narrower than `varchar(64)`**. dograh's external ARI
+  channel is named `dograh-ext-<uuid>` (47 characters); under strict SQL mode the 32-character
+  columns FreePBX ships reject every record for it, so the dograh leg silently vanishes from
+  the call history. The guard widens all four columns back.
+
+It has to run where the PBX container lives, because every repair is a `docker exec` into it:
+
+```bash
+install -m 0755 deploy/ari-dupe-guard.sh  /usr/local/sbin/ari-dupe-guard.sh
+install -m 0644 deploy/ari-dupe-guard.cron /etc/cron.d/ari-dupe-guard
+```
+
+## Voice hardening — the endpoint settings live in the repo now
+
+`deploy/pbx-voice-hardening.sh` owns the PJSIP settings that keep a call up.
+They were previously hand edits on the host, which a rebuilt config volume
+silently reverts to FreePBX's defaults:
+
+| Setting | FreePBX default | Estate | Why |
+|---|---|---|---|
+| `rtp_timeout` | `30` | `0` | A handset that stops sending RTP for 30 s had its call torn down mid-interview (`res_pjsip_sdp_rtp: lack of audio RTP activity in 30 seconds`, 30 s before a 121 s call ended). A stall is not a reason to drop the call. |
+| `rtp_keepalive` | `0` | `15` | Keeps media flowing from this side instead of waiting to be declared dead. |
+| `rtp_timeout_hold` | `300` | `1800` | Long holds were dropped mid-MOH. |
+| `direct_media` | `yes` | `no` | Asterisk must stay in the media path for hold/MOH on internal calls. |
+| `mailboxes` | `@device` | `@default` | MWI has to name a mailbox that exists in `voicemail.conf`; 102 is the fax and has none. |
+
+```bash
+install -m 0755 deploy/pbx-voice-hardening.sh /usr/local/sbin/pbx-voice-hardening.sh
+pbx-voice-hardening.sh --check   # drift report; exit 1 when it does not hold
+pbx-voice-hardening.sh --render  # the managed block, for review
+pbx-voice-hardening.sh           # apply, reload res_pjsip, re-read the live values
+```
+
+It writes one marked block into `pjsip.endpoint_custom_post.conf`, so the
+settings come back on a rebuilt box. `pjsip reload` is **not** an Asterisk
+command — `module reload res_pjsip.so` is what re-reads the file — and the
+script verifies the live values afterwards rather than trusting the write.
+
+`scripts/rtp_probe.py` is the evidence tool for the next stall: capture the
+media during the event, then read the gaps back per stream.
+
+```bash
+python3 scripts/rtp_probe.py --capture 300 --iface br0 -o /var/tmp/rtp.pcap
+python3 scripts/rtp_probe.py --pcap /var/tmp/rtp.pcap --gap 2.0  # exit 2 on a 30 s stall
+```
+
+One thing to know before reading an empty result: on this stack the agent leg is
+a `WebSocket/dograh/…` channel over ARI, not RTP, so **only handset legs emit
+RTP**. A local `Local/201@from-internal` test call therefore captures no media at
+all, and the two inactivity notices ever logged both named `PJSIP/101-…`. Capture
+while someone is on a real call from 101.
+
+### Watchers on the PBX host
+
+Two cron jobs run where the PBX container does, so the estate keeps its
+evidence and its warm cache without anyone remembering to ask:
+
+| Job | Every | What it does | Log |
+|---|---|---|---|
+| `rtp-stall-watch.sh` | 1 min | Captures the media of the next call on 101/102/301/302 and analyses it with `rtp-probe.py`; a stream silent for 30 s or more gets its own `STALL:` line that names the cause (the handset stopped sending vs. the path dropped the packets), and **every** analysed call gets a `VERDICT:` line — a healthy call is evidence too | `/var/log/rtp-watch/watch.log` |
+| `prewarm-watch.sh` | 5 min | Re-exports the routes' `initial_context`, re-renders the greetings, and on drift regenerates the list, installs it in the shim's volume and `POST /prewarm`s — no restart, so no caller waits. Writes its verdict (in sync, drifted, repaired) to a status file every run | `/var/log/prewarm-watch.log`, `/var/lib/capstone-prewarm/status.json` |
+
+```bash
+install -m 0755 deploy/rtp-stall-watch.sh /usr/local/sbin/rtp-stall-watch.sh
+install -m 0644 deploy/rtp-stall-watch.cron /etc/cron.d/rtp-stall-watch
+install -m 0755 deploy/prewarm-watch.sh   /usr/local/sbin/prewarm-watch.sh
+install -m 0644 deploy/prewarm-watch.cron /etc/cron.d/prewarm-watch
+install -m 0755 deploy/greeting-contexts.sh /usr/local/sbin/greeting-contexts.sh
+install -m 0755 scripts/rtp_probe.py /usr/local/bin/rtp-probe.py
+install -m 0755 deploy/handset-probe.sh /usr/local/sbin/handset-probe.sh
+install -m 0755 scripts/voice_check.py /usr/local/bin/voice-check.py
+```
+
+The prewarm watcher reads the contexts from where they actually live —
+`telephony_phone_numbers.extra_metadata` merged with the workflow's
+`template_context_variables`. Today every route's `extra_metadata` is `{}`, so
+the greetings render with their fallbacks (which is what the shim already
+prewarms); the day a route is given a name to greet, the next tick renders that
+greeting too and prewarms it before anyone calls.
+
+### What the watchers report, and where it is seen
+
+Both jobs are quiet by design — a silent log is the healthy state — which is
+why their verdicts are also published to places an operator already looks:
+
+| Surface | Shows |
+|---|---|
+| `GET /voice` (dashboard-api) | The installed greeting list, the last drift check, and every captured call / 30 s silence |
+| Health → **Voice — greeting prewarm & handset media** | The same, polled every 30 s, including *why* a leg went silent |
+| Alerts, ids `al-voice-*` | `prewarm-stale` (the timer stopped), `prewarm-drift` (the list no longer matches the routes), `prewarm-error` (state unreadable), `rtp-stall` (a handset leg went silent within 24 h) |
+| SMS, `VOICE_ALERT_SMS_TO` | The same alerts, one message each, deduplicated by alert id and message digest, through OpenSMS — the path `/sms-outbound` already uses. Off until a recipient and `OPENSMS_*` are set; the panel says which is missing |
+
+Those are derived from the status file and the watcher log, so they cost a file
+read rather than a `docker exec`. A host with neither file reports
+`installed: false` and raises no alerts. The stall investigation itself, and the
+rule that settles it, is in [voice-rtp-stall.md](voice-rtp-stall.md).
+
+### Making a handset answer, so the media question can close
+
+`deploy/handset-probe.sh <ext>` rings a handset with an auto-answer INVITE
+(`Call-Info: <sip:x>;answer-after=0`, the intercom convention) and holds the call
+long enough for the watcher to capture it, then prints the `VERDICT:` line. It
+puts its dialplan in `extensions_custom_handset_probe.conf` and appends a single
+`#include` line to `extensions_custom.conf` (backed up, idempotent) because
+Asterisk's `channel originate` cannot add a SIP header — and because rewriting
+the estate's hand-written dialplan in place is how a probe takes the agents down.
+Our side sends no audio and records nothing, so an auto-answered handset hears
+silence.
+
+It tries both conventions (`Call-Info` then `Alert-Info`) and prints the SIP
+exchange it saw — the INVITE, whether the auto-answer header was on it, and the
+phone's status codes — because "it did not answer" is only useful with that
+evidence. On 2026-11-25 that evidence closed the media question: the `Call-Info`
+INVITE reached 101 carrying `answer-after=0`, the handset answered `200 OK`, and
+the call then sent 6,450 RTP packets over 129 s with a longest silence of 0.0 s —
+`VERDICT: continuous`. Two probe defects had to be fixed first, and both are worth
+knowing about: the variant names (`call-info`) did not match the dialplan contexts
+(`…-callinfo`), so `channel originate` logged `No such extension/context` and never
+placed a call at all; and `rtp_probe.py` counted each packet twice in an `-i any`
+capture (physical interface plus the bridge/DNAT leg), so half the sequence steps
+were zero and real media was rejected as a lookalike — a 12,900-packet call read as
+`no-media`. Details and the wire evidence are in [voice-rtp-stall.md](voice-rtp-stall.md).
+
+### Is the wiring alive, not just installed?
+
+`scripts/voice_check.py` (installed as `/usr/local/bin/voice-check.py`) asserts
+the things that must be *running*: the stall watcher scheduled and logging, the
+prewarm status rewritten inside its window, the Control Center able to see the
+host files, and the SMS push armed and not erroring once `VOICE_ALERT_SMS_TO` is
+set. It also reads the container's `asterisk-config` volume for the one thing a
+running watcher cannot show: `bindaddr` is still `127.0.0.1`, no AMI account
+permits anything but loopback, and `didtest` has not come back. Exit 0 alive, 1
+something is broken (a bad AMI outranks a quiet host), 2 no watchers installed at
+all.
+
+```bash
+voice-check.py            # the gate; run it after a deploy
+```
+
+`scripts/smoke-test.sh` runs it in **Voice watchers — alive, not just installed**,
+so a cron that quietly stopped fails a smoke run instead of leaving a page that
+says "in sync" forever.
+
+## Platform address — the name and the LAN IP are not interchangeable
+
+| Surface | Address | Reachable from |
+|---|---|---|
+| Console, `/healthz` | `https://pbx.innotel.site` | anywhere (443/80 published) |
+| SSH 22, SIP 5060/5061, ARI 8088, SMS webhook 8080 | `192.168.1.52` | LAN only |
+
+`pbx.innotel.site` resolves to the box's own egress address, so it is the same
+host under a public name, not a second estate. Only 443/80 are published, so:
+use the name for the console and for health checks, and keep the LAN address for
+SSH, SIP and the `/sms-inbound` webhook. `POST https://pbx.innotel.site/sms-inbound`
+returns **404** — the 200 on `GET` is the console's SPA fallback — so pointing a
+provider's webhook at the public name silently loses messages.
+```
+
+It stays quiet while healthy, which is what makes a non-empty log worth reading. A missing
+app with **ARI unreachable** is still not repaired, and deliberately so: the guard only acts
+when the symptom is one it can actually fix, rather than churning for the whole outage.
 
 If you would rather fix it by hand, the two commands are:
 
@@ -410,7 +579,7 @@ never dograh's fault and never a credential problem, so re-running
 
 ```bash
 systemctl start zeus-pbx-sync.service        # check -> restore ari.conf -> reload
-./scripts/dograh-ari-recover.sh recover      # un-park dograh's config, wait for the app
+/usr/local/sbin/ari-dupe-guard.sh            # repair the duplicate section + un-park the config
 docker exec <freepbx-container> asterisk -rx "ari show apps"   # expect dograh_<hex>
 ```
 
@@ -1234,38 +1403,98 @@ fail2ban-regex /tmp/attacks.log /etc/fail2ban/filter.d/asterisk-registration.con
 # get dropped (then unban it) — see the CI job for the exact line.
 ```
 
-**AMI answers on the host LAN IP only.** Two independent things keep it that way,
-and only one of them actually stops a client:
+**AMI listens on loopback only, and nothing publishes it.** `manager.conf`
+carries `bindaddr = 127.0.0.1`, so Asterisk opens `5038` on the container's own
+loopback. The compose file went on publishing it on `192.168.1.52:5038`, which
+accepted the TCP connection only to have the container refuse it; that line was
+removed on 2026-11-25 and the container recreated, so the host no longer listens
+on `5038` at all.
 
-- **The port binding.** `docker-compose.yml` publishes `5038` on the host LAN IP
-  (`PJSIP_MEDIA_ADDRESS`) — never `0.0.0.0`, never a docker address (project
-  rule: README → Addressing). The portal dials that same LAN IP, so the bind and
-  the target agree. On a shared Zeus PBX the port belongs to that stack
-  (`zeus/docker-compose.full.yml`), which still publishes it on
-  `0.0.0.0` and needs the same pin.
-- **The AMI ACL.** The image wrote `permit = 0.0.0.0/0.0.0.0` for the portal's
-  AMI user, so any address that could reach the port could also authenticate
-  against it. `pbx/entrypoint-dograh.sh` now narrows `[pbxportal]` to loopback
-  plus this host's LAN subnet, idempotently, on every boot:
+```bash
+docker exec pbx-freepbx asterisk -rx "manager show settings" | grep -i bindaddress
+#  TCP Bindaddress:           127.0.0.1:5038
+ss -ltn | grep 5038 || echo 'nothing on 5038'      # on the host
+#  nothing on 5038
+```
+
+Three things make that hold, each checked rather than assumed:
+
+- **`/etc/asterisk` is a volume** (`…_asterisk-config`), so the line survives a
+  container recreate, and `fwconsole reload` does not rewrite it — reload
+  returned 0, the bind stayed `127.0.0.1`, and a real login was re-tested after.
+- **Local clients still work.** `ucp_events` (UCP) and the generated hex user
+  both authenticate from `127.0.0.1`; both are in use, so deleting either breaks
+  UCP or the portal's AMI poll.
+- **Remote use goes through the container, not the host.** `ssh -L
+  5038:127.0.0.1:5038 root@192.168.1.52` does *not* work — the socket is on the
+  container's loopback, and the host has nothing listening to forward to. Carry
+  the AMI stream over the exec instead; the container has `socat`, so this gets a
+  real login prompt:
 
   ```bash
-  docker exec pbx-freepbx asterisk -rx "manager show user pbxportal" | tail -3
-  #  0:  deny - 0.0.0.0/0.0.0.0
-  #  1:  allow - 127.0.0.1/255.255.255.255
-  #  2:  allow - 192.168.1.0/255.255.255.0   (PJSIP_LOCAL_NET)
+  printf 'Action: Login\r\nUsername: <user>\r\nSecret: <secret>\r\n\r\n' \
+    | ssh root@192.168.1.52 "docker exec -i pbx-freepbx socat - TCP:127.0.0.1:5038"
+  #  Response: Success
+  #  Message: Authentication accepted
   ```
 
-  The ACL is the half that decides, and what it decides on is the source
-  address. The portal dials the host LAN IP, the host masquerades that
-  connection, and Asterisk sees the LAN address — which the LAN permit admits.
-  A client that reaches Asterisk by any other route is refused
-  (`SecurityEvent="FailedACL"`). Same user, same secret, opposite outcomes — so
-  check the address a client's packets carry before touching the secret.
+Reading the credentials — they are not in this repo, and they should not be
+pasted into a ticket or a chat:
 
-  A scanner that clears the ACL — through the router's forward, or the Zeus
-  stack's own binding — lands in the security log as `Service="AMI"` /
-  `RequestType="Action: NONE"` and is banned by the `asterisk-security` jail
-  (see the filter's `RequestBadFormat` entry).
+```bash
+docker exec pbx-freepbx sh -c 'sed -n "/^\[/p;/^secret/p" \
+  /etc/asterisk/manager_custom.conf /etc/asterisk/manager.conf'
+```
+
+To go back to LAN-reachable AMI, restore
+`/etc/asterisk/manager.conf.bak-bind-<stamp>` inside the container and run
+`asterisk -rx "manager reload"`. The ACL is the second layer, and the one that
+decides once something can reach the port:
+
+- **The AMI ACL.** Every account starts at `deny = 0.0.0.0/0.0.0.0` and then
+  names its permits; on this box `pbxportal` and `ucp_events` permit `127.0.0.1`
+  and nothing else. The last account holding a LAN permit, `didtest`
+  (`192.168.1.113`), was the inbound DID harness's AMI login: it authenticated
+  every 15 minutes until **2026-11-24 17:38** (its last `SuccessfulAuth`, in
+  `security` — it also logged `InvalidPassword` in bursts whenever its stored
+  secret drifted), and went silent after that. It was retired on 2026-11-25: the
+  block is gone from `manager_custom.conf`, so `manager show user didtest`
+  answers "There is no manager called didtest" and a login attempt is logged as
+  `InvalidAccountID`. The harness behind `/usr/local/bin/did-inbound-test` on
+  `192.168.1.113` still expected it, so it got an account of its own instead:
+  `[didiag]`, added 2026-11-25 with exactly the permissions `didtest` had
+  (`read = system,call,reporting,command`, `write = call,command`) and a permit
+  for `127.0.0.1` only — it reaches AMI over the exec path above rather than from
+  its own address. The harness still needs `didiag`'s secret put in its place;
+  `192.168.1.113` refused every credential the fleet store holds (all five root
+  logins were tried on 2026-11-25; the box runs OpenSSH 10.2p1 and serves
+  nothing on 80, 443 or 9292), so that half is open. To bring `didtest` back, restore
+  `/etc/asterisk/manager_custom.conf.bak-didtest-<stamp>` inside the container and
+  run `asterisk -rx "manager reload"` — and expect `voice-check.py` to fail until
+  you take it out again. The PJSIP endpoint `telno-didtest` is a different thing —
+  the harness's SIP side — and was left in place.
+
+The swap on the harness host, once someone has a login there (the secret is read
+from the PBX, never typed into a shell or a chat):
+
+```bash
+# on 192.168.1.113
+SECRET=$(ssh root@192.168.1.52 \
+  'docker exec freepbx-qvifit87vftfxd9ejsch2vxy sed -n "/^\[didiag\]/,/^\[/p" \
+     /etc/asterisk/manager_custom.conf | sed -n "s/^secret *=* *//p"')
+# set $SECRET as didiag's AMI password in the harness config, restart the harness,
+# and confirm from the PBX: tail -1 /var/log/asterisk/security must carry
+# AccountID="didiag" — an AMI login still on the old secret logs InvalidAccountID.
+```
+
+Do not echo `$SECRET`; the reader above prints every account's secret, so its
+output belongs nowhere but that assignment.
+
+AMI auth failures do reach the `security` log — `SecurityEvent="InvalidAccountID"`
+with `Service="AMI"` and a `TCP` `RemoteAddress` — and the `asterisk-capstone`
+filter matches them, proved with `fail2ban-regex` against the live log. With the
+loopback bind there is no remote attempt left to ban, which is why no
+AMI-specific jail was added.
 
 The ordering is load-bearing: Asterisk honours the **last** matching ACL entry,
 so the permits must come *after* the deny. Put them before it and every AMI login

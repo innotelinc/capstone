@@ -46,6 +46,8 @@ from . import sms_inbound
 from . import sms_outbound
 from . import sms_transport
 from . import stack_access
+from . import voice
+from . import voice_notify
 from . import workflows
 from .auth import (
     COOKIE_NAME,
@@ -94,7 +96,7 @@ NPM_SUBDOMAINS: dict[str, str] = {
     "dograh-api": "api",
     "dograh-ui": "app",
     "authentik-server": "auth",
-    "pbx-freepbx": "pbx",
+    "cantus-switch": "pbx",
     "omniroute": "omniroute",
     "n8n": "n8n",
     "grist": "grist",
@@ -181,10 +183,10 @@ SERVICE_META: dict[str, dict[str, Any]] = {
         "description": "Identity provider and SSO gateway for user management and authentication across the stack.",
         "tags": ["auth", "sso", "identity"], "deps": ["authentik-postgres", "authentik-redis"],
     },
-    "freepbx": {
-        "name": "FreePBX", "owner": "PBX Ops",
-        "description": "Asterisk/FreePBX PBX hosting SIP registrations, dialplan, and inbound route mappings for Capstone agents.",
-        "tags": ["pbx", "asterisk", "sip"], "deps": ["dograh-api"],
+    "cantus-switch": {
+        "name": "Cantus switch", "owner": "Voice Ops",
+        "description": "Cantus 1.0 voice plane: signalling, media, the control API, the ARI surface dograh dials and the browser softphone socket — one process, three ports.",
+        "tags": ["pbx", "cantus", "telephony"], "deps": ["dograh-api"],
     },
     "omniroute": {
         "name": "OmniRoute", "owner": "Platform",
@@ -320,8 +322,13 @@ LINK_PORTS: dict[str, dict[str, str]] = {
     "dograh-api": {"port": "8000", "name": "Capstone Voice API"},
     "dograh-ui": {"port": "3010", "name": "Capstone Voice App"},
     "authentik-server": {"port": "9100", "name": "Authentik"},
-    "pbx-freepbx": {"port": "80", "name": "FreePBX"},
-    "portal": {"port": "3000", "name": "PBX Portal"},
+    "cantus-switch": {"port": "8088", "name": "Cantus switch"},
+    # Not a compose service: the portal is Zeus's app, answered under Zeus's own
+    # names, so `build_links` replaces this port with `portal_origin()`. The row
+    # still has to be in the map: it is what gives the Links page a portal entry
+    # to resolve, and dropping it (as the Asterisk removal briefly did, along
+    # with the retired FreePBX rows) removes the row entirely.
+    "portal": {"port": "3000", "name": "Zeus Portal"},
     "omniroute": {"port": "20128", "name": "OmniRoute"},
     "n8n": {"port": "5678", "name": "n8n"},
     "grist": {"port": "8484", "name": "Grist"},
@@ -335,7 +342,7 @@ ONE_SHOT = {"sandbox-certs", "n8n-import", "healthprobe"}
 
 # List of compose service labels we consider "apps" (used for active-session
 # stand-in and to exclude infra-only noise from some tallies).
-APP_SERVICES = {"dograh-api", "dograh-ui", "n8n", "omniroute", "grist", "grafana", "speaches", "freepbx", "workflow-studio", "coturn"}
+APP_SERVICES = {"dograh-api", "dograh-ui", "n8n", "omniroute", "grist", "grafana", "speaches", "cantus-switch", "workflow-studio", "coturn"}
 
 # Static documentation / repository / support links (real URLs; unaffected by
 # Docker state).
@@ -343,8 +350,7 @@ STATIC_LINKS = [
     {"id": "doc-capstone", "name": "Capstone README", "description": "Project overview, release notes, and non-negotiables.", "url": "https://capstone.innotel.us", "category": "documentation", "status": "verified", "lastVerified": None},
     {"id": "doc-upstream", "name": "Dograh Platform", "description": "Upstream dograh voice-agent platform used by this stack.", "url": "https://github.com/dograh-hq/dograh", "category": "repositories", "status": "verified", "lastVerified": None},
     {"id": "doc-otel", "name": "OpenTelemetry Docs", "description": "OTel collector config patterns used in this stack.", "url": "https://opentelemetry.io/docs/", "category": "documentation", "status": "verified", "lastVerified": None},
-    {"id": "doc-asterisk", "name": "Asterisk Project", "description": "PBX core documentation for FreePBX and ARI.", "url": "https://www.asterisk.org/", "category": "external", "status": "verified", "lastVerified": None},
-    {"id": "doc-freepbx", "name": "FreePBX Docs", "description": "FreePBX module and dialplan documentation.", "url": "https://wiki.freepbx.org/", "category": "documentation", "status": "verified", "lastVerified": None},
+    {"id": "doc-cantus", "name": "Cantus 1.0 spec", "description": "The voice plane this stack runs: node, relay, routing document and the ARI surface.", "url": "https://github.com/innotelinc/jesus/tree/main/apps/cantus/spec", "category": "documentation", "status": "verified", "lastVerified": None},
     {"id": "doc-authentik", "name": "Authentik Docs", "description": "Self-hosted identity provider used for authentication and SSO.", "url": "https://docs.goauthentik.io/", "category": "documentation", "status": "verified", "lastVerified": None},
 ]
 
@@ -799,6 +805,10 @@ def build_alerts() -> list[dict[str, Any]]:
     # it still is. Derived from the recovery history rather than a container
     # status, because a recovered box looks perfectly healthy afterwards.
     alerts.extend(_pbx_recovery_alerts())
+    # Voice: a handset leg that stopped sending, or a greeting cache that has
+    # drifted from what the routes render. The host watchers already record
+    # both; this is where they become something an operator will actually see.
+    alerts.extend(voice.build_voice_alerts())
     if not alerts:
         alerts.append({
             "id": "al-all-clear",
@@ -3659,6 +3669,86 @@ def _pbx_dialplan_text() -> str:
         return val
 
 
+# ── the voice plane this deployment actually has ───────────────────────────
+# FreePBX is what this console was written against, and the writer half still
+# speaks to it (`_pbx_exec`). A CHRIST box has no FreePBX at all: the voice
+# plane is the Cantus switch, whose lines are set with `POST /v1/lines` and
+# whose dial plan is one JSON routing document. Asking the switch is therefore
+# the same question the PBX branch asks, in the only dialect that answers here —
+# without this, every agent on a Cantus stack reported "PBX container not
+# running", which is true and useless: there is no PBX to run.
+CANTUS_URL = (os.environ.get("CANTUS_URL") or "").rstrip("/")
+CANTUS_CONTROL_TOKEN = os.environ.get("CANTUS_CONTROL_TOKEN") or ""
+
+
+def _cantus_get(path: str) -> Any:
+    """One read from the switch's control API, or None when it is unreachable."""
+    if not CANTUS_URL:
+        return None
+    try:
+        import json as _json
+        import urllib.request as _url
+
+        req = _url.Request(f"{CANTUS_URL}{path}")
+        if CANTUS_CONTROL_TOKEN:
+            req.add_header("authorization", f"Bearer {CANTUS_CONTROL_TOKEN}")
+        with _url.urlopen(req, timeout=5) as res:
+            return _json.loads(res.read().decode("utf-8"))
+    except Exception:  # noqa: BLE001 - an unreachable switch is a state, not a crash
+        return None
+
+
+def _cantus_state() -> tuple[dict[str, dict], list[dict]] | None:
+    """(lines by extension, the routing document's routes) — None if unreachable."""
+    lines = _cantus_get("/v1/lines")
+    if not isinstance(lines, list):
+        return None
+    doc = _cantus_get("/v1/routes")
+    routes = (doc or {}).get("routes") if isinstance(doc, dict) else None
+    return ({str(l.get("ext")): l for l in lines if isinstance(l, dict) and l.get("ext")},
+            routes if isinstance(routes, list) else [])
+
+
+def _cantus_status_payload(ext: str, line: dict | None, routes: list[dict]) -> dict:
+    """Provisioning status for an agent's extension on a Cantus stack.
+
+    The three FreePBX pieces map onto three real things here: a line on the
+    switch, a route that lands on that line, and a DID whose chain bridges to
+    it. Answering with the switch's own inventory means "not provisioned" is a
+    fact an operator can act on rather than a missing container.
+    """
+    wired = any(
+        str(((step.get("bridge") or {}).get("to") or "")) == ext
+        for route in routes if isinstance(route, dict)
+        for step in (route.get("then") or []) if isinstance(step, dict)
+    )
+    reachable = any(
+        str(((route.get("when") or {}).get("to") or "")).split("@")[0].rstrip("*") == ext
+        for route in routes if isinstance(route, dict)
+    )
+    has_did = any(
+        isinstance(route, dict)
+        and any(str(((step.get("bridge") or {}).get("to") or "")) == ext for step in (route.get("then") or []) if isinstance(step, dict))
+        and not str(((route.get("when") or {}).get("to") or "")).startswith("line-")
+        for route in routes
+    )
+    has_line = bool(line)
+    payload = {"status": "provisioned" if (has_line and reachable) else ("partial" if (has_line or reachable) else "not-provisioned"),
+               "customExtension": has_line, "inboundRoute": has_did, "dialplan": reachable}
+    if line:
+        numbers = line.get("numbers") or []
+        payload["detail"] = (
+            f"line {ext} on the Cantus switch"
+            + (f" · {numbers[0]}" if numbers else "")
+            + (" · phone registered" if line.get("registered") else " · no phone registered")
+        )
+    elif wired or reachable:
+        payload["detail"] = f"routed on the switch, no line {ext} of its own"
+    else:
+        payload["detail"] = f"no line and no route for {ext} on the Cantus switch"
+    return payload
+
+
 def _pbx_status_payload(has_ext: bool, has_route: bool, has_dp: bool) -> dict:
     """Provisioning status for one extension, in the shape the list expects.
 
@@ -3724,6 +3814,13 @@ def _agent_pbx_statuses(exts: list[str]) -> dict[str, dict]:
     Whole page in one PBX query plus one cached `dialplan show`: the Agents list
     probes every agent, and each probe used to be its own `docker exec`.
     """
+    # No FreePBX and a Cantus switch configured: ask the switch. This is the
+    # normal case on a CHRIST box, where the voice plane never was Asterisk.
+    if _pbx_container() is None:
+        state = _cantus_state()
+        if state is not None:
+            lines, routes = state
+            return {e: _cantus_status_payload(e, lines.get(e), routes) for e in exts}
     try:
         counts = _pbx_provisioning_counts(exts)
         dp = _pbx_dialplan_text()
@@ -4043,6 +4140,62 @@ def pbx_health(user: dict = Depends(require_session)):
     """PBX self-healing state + recovery history on its own, for callers that
     want it without the whole matrix."""
     return pbx_recovery_status()
+
+
+@app.get("/voice")
+def voice_status(user: dict = Depends(require_session)):
+    """Greeting prewarm state + captured handset media, from the host watchers.
+
+    Backs the Health page's Voice panel: is the prewarm list still what the
+    routes render, when was it last checked, and did any handset leg stop
+    sending RTP. Read-only; a host without the watchers reports `installed:
+    false` instead of failing.
+    """
+    return voice.build_voice_status()
+
+
+# --------------------------------------------------------------------------
+# Voice alerts → SMS
+# --------------------------------------------------------------------------
+# The Alerts page assumes somebody is looking at it. A handset leg that went
+# silent at 03:00 is exactly what nobody is looking at, so the voice alerts are
+# also pushed as one SMS each — opt-in (VOICE_ALERT_SMS_TO plus a gateway),
+# deduplicated per alert by voice_notify, and never fatal: the page stays the
+# record, the SMS is the nudge.
+_voice_push_started = False
+
+
+def _voice_alert_push_loop(interval: float) -> None:
+    while True:
+        try:
+            sent = voice_notify.dispatch(voice.build_voice_alerts())
+            if sent.get("sent"):
+                logger.info("voice alert SMS sent: %s", ", ".join(sent["sent"]))
+            elif sent.get("error"):
+                logger.debug("voice alert SMS not sent: %s", sent["error"])
+        except Exception as exc:  # noqa: BLE001 - the loop must never die
+            logger.debug("voice alert push error: %s", exc)
+        time.sleep(interval)
+
+
+@app.on_event("startup")
+def _start_voice_alert_push() -> None:
+    """Start the SMS nudge loop once, and only when it is actually configured."""
+    global _voice_push_started
+    if _voice_push_started:
+        return
+    if not voice_notify.enabled():
+        logger.info(
+            "voice alert SMS push off — set %s and OPENSMS_URL/OPENSMS_API_KEY to arm it",
+            voice_notify.TO_ENV,
+        )
+        return
+    _voice_push_started = True
+    threading.Thread(
+        target=_voice_alert_push_loop, args=(voice_notify.interval(),),
+        name="voice-alert-push", daemon=True,
+    ).start()
+    logger.info("voice alert SMS push started (every %.0fs)", voice_notify.interval())
 
 
 @app.get("/authentik/access")

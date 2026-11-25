@@ -1,0 +1,8 @@
+# Greetings the shim synthesizes into its cache at startup, so the first
+# caller does not pay for synthesis (1.76 s vs 74 ms measured on this host).
+# Generated: python3 scripts/dograh_wire.py --write-prewarm
+# The text is part of the cache key, so it must match the *rendered*
+# greeting exactly — including the fallbacks used when a route supplies no
+# initial_context. `--check-prewarm` fails when this file drifts.
+Hi there, this is Jordan from our company. I'm the interviewer for the role. Thanks for making time today.
+Hi there, this is Robin from our organization. We're running a short survey — it takes about a few minutes. Do you have a quick minute to answer a few questions?
