@@ -338,6 +338,17 @@ inject_dialplan() {
 # [general] and any other users (e.g. a zeus ARI user on a shared PBX) pass
 # through untouched. inject_dialplan() doubles as the no-python fallback
 # here — it merges per [section] generically.
+# A rebuilt /etc/asterisk volume can carry a stale ari.conf symlink: ours
+# pointed at /var/www/html/admin/modules/arimanager/etc/ari.conf, a module the
+# fullstack image does not ship. `touch` on that dangling link aborts the whole
+# entrypoint under `set -e`, which crash-looped the PBX on every restart.
+# Replace it with the plain file the image ships (only [general] enabled = yes
+# is active there; every other option is commented out).
+if [ -L "${DEST}/ari.conf" ] && [ ! -e "${DEST}/ari.conf" ]; then
+  echo ">>> [dograh-ari] ari.conf is a dangling symlink -> $(readlink "${DEST}/ari.conf"); replacing it with a plain file"
+  rm -f "${DEST}/ari.conf"
+  printf '[general]\nenabled = yes\n' > "${DEST}/ari.conf"
+fi
 if [ -f "${SRC}/ari.conf" ]; then
   touch "${DEST}/ari.conf"
   # Render the password into a temp fragment BEFORE merging, so the real
