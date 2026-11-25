@@ -467,6 +467,115 @@ if [ -f "${DEST}/http.conf" ]; then
   chown asterisk:asterisk "${DEST}/http.conf" 2>/dev/null || true
 fi
 
+# ── Asterisk Console AMI access (durable) ─────────────────────────────────
+# The Asterisk Console authenticates to AMI as [asterisk-console]. That wiring
+# used to be two hand edits INSIDE the asterisk-config volume — `bindaddr` in
+# manager.conf and the user section in manager_console.conf — so any rebuild that
+# recreated the volume cut the console off (AMI came back loopback-only, with no
+# console user at all). Keep the canonical copies in the repo and re-assert the
+# live files on every boot instead:
+#
+#   • manager_console.conf — rendered from pbx/asterisk/manager_console.conf
+#     (shipped to /opt/pbx-scripts; /opt/pbx-dograh is the fallback for compose
+#     deployments that mount ./pbx/asterisk directly) with CONSOLE_AMI_SECRET,
+#     so the credential itself never has to be committed;
+#   • `#include manager_console.conf` — appended to manager_custom.conf, the one
+#     AMI file FreePBX never regenerates (the stock entrypoint rewrites only its
+#     `secret =` lines);
+#   • manager.conf [general] bindaddr — pinned to loopback. AMI is not published
+#     on the compose network: the ami-bridge socat sidecar shares this
+#     container's network namespace and exposes 15038 → 127.0.0.1:5038, which is
+#     how the console (ami_host=freepbx, ami_port=15038) reaches it.
+#
+# Without CONSOLE_AMI_SECRET the rendered copy is left alone (the console keeps
+# the credential it already had) — the CHANGE_ME template is never installed.
+console_ami_template() {
+  local cand
+  for cand in /opt/pbx-scripts/manager_console.conf "${SRC}/manager_console.conf"; do
+    [ -f "${cand}" ] && { printf '%s\n' "${cand}"; return 0; }
+  done
+  return 1
+}
+
+ensure_console_ami() {
+  local tpl dst mc
+  tpl="$(console_ami_template)" || {
+    echo ">>> [dograh-ari] WARNING: manager_console.conf template not found — console AMI untouched" >&2
+    return 0
+  }
+  dst="${DEST}/manager_console.conf"
+  if [ -n "${CONSOLE_AMI_SECRET:-}" ]; then
+    if python3 - "${tpl}" "${dst}" "${CONSOLE_AMI_SECRET}" <<'PYEOF'
+import sys
+tpl, dst, secret = sys.argv[1], sys.argv[2], sys.argv[3]
+if "\n" in secret or "\r" in secret or not secret.strip():
+    sys.exit("CONSOLE_AMI_SECRET is empty or multiline")
+out, seen = [], False
+for line in open(tpl).read().split("\n"):
+    if line.strip().startswith("secret"):
+        line, seen = "secret = " + secret, True
+    out.append(line)
+if not seen:
+    sys.exit("template has no secret line")
+open(dst, "w").write("\n".join(out))
+PYEOF
+    then
+      chmod 640 "${dst}" 2>/dev/null || true
+      echo ">>> [dograh-ari] manager_console.conf rendered from $(basename "${tpl}")"
+    else
+      echo ">>> [dograh-ari] WARNING: manager_console.conf not rendered (template/secret rejected)" >&2
+    fi
+  else
+    echo ">>> [dograh-ari] CONSOLE_AMI_SECRET unset — keeping existing manager_console.conf"
+  fi
+  chown asterisk:asterisk "${dst}" 2>/dev/null || true
+
+  mc="${DEST}/manager_custom.conf"
+  touch "${mc}"
+  if ! grep -qE '^[[:space:]]*#include[[:space:]]+manager_console\.conf' "${mc}"; then
+    {
+      echo
+      echo "; Asterisk Console AMI user — rendered from manager_console.conf on every boot"
+      echo "#include manager_console.conf"
+    } >> "${mc}"
+    chown asterisk:asterisk "${mc}" 2>/dev/null || true
+    echo ">>> [dograh-ari] manager_custom.conf includes manager_console.conf"
+  fi
+
+  # manager.conf is FreePBX-managed (regenerated on reload), so the bindaddr is
+  # re-pinned on every boot; loopback is deliberate — ami-bridge owns exposure.
+  python3 - "${DEST}/manager.conf" <<'PYEOF' 2>/dev/null || true
+import sys
+p = sys.argv[1]
+lines = open(p).read().split("\n")
+out, section, done, msg = [], None, False, ""
+for line in lines:
+    s = line.strip()
+    if s.startswith("[") and s.endswith("]"):
+        section = s[1:-1]
+    if section == "general" and s.split("=", 1)[0].strip() == "bindaddr" and not done:
+        if line.strip() != "bindaddr = 127.0.0.1":
+            msg = ">>> [dograh-ari] manager.conf AMI bindaddr re-pinned to 127.0.0.1 (ami-bridge exposes 15038)"
+        line, done = "bindaddr = 127.0.0.1", True
+    out.append(line)
+if not done:
+    for i, line in enumerate(out):
+        if line.strip() == "[general]":
+            out.insert(i + 1, "bindaddr = 127.0.0.1")
+            msg = ">>> [dograh-ari] manager.conf AMI bindaddr pinned to 127.0.0.1 (ami-bridge exposes 15038)"
+            break
+open(p, "w").write("\n".join(out))
+if msg:
+    print(msg)
+PYEOF
+  chown asterisk:asterisk "${DEST}/manager.conf" 2>/dev/null || true
+
+  asterisk -rx "manager reload" >/dev/null 2>&1 || true
+}
+
+# Console AMI user + bindaddr, before Asterisk first loads the configs.
+ensure_console_ami
+
 echo ">>> [dograh-ari] configs injected — starting stock entrypoint in background"
 
 # ── Harden the stock entrypoint's value-injecting s/// seds ───────────────
@@ -760,6 +869,7 @@ for i in $(seq 1 60); do
     fwconsole reload >/tmp/dograh-ari-reload.log 2>&1 || true
     fix_include_hygiene
     fix_modules_conf
+    ensure_console_ami
 
     # Re-assert the two rows of rtp_additional.conf that FreePBX just mangled.
     # `Sipsettings::genConfig()` strtolower()s turnusername/turnpassword (a TURN
